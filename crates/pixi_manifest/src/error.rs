@@ -24,6 +24,8 @@ pub enum DependencyError {
     NoDependency(String),
     #[error("No Pypi dependencies.")]
     NoPyPiDependencies,
+    #[error("PyPI no-deps dependency '{0}' must be pinned with '=='.")]
+    NoDepsRegistryNotPinned(String),
     #[error(transparent)]
     Pep508ToPyPiRequirementError(#[from] Box<Pep508ToPyPiRequirementError>),
 }

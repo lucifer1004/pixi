@@ -15,7 +15,7 @@ use crate::{
     task::{Task, TaskName},
     utils::PixiSpanned,
 };
-use pixi_pypi_spec::{PixiPypiSpec, PypiPackageName};
+use pixi_pypi_spec::{PixiPypiSource, PixiPypiSpec, PypiPackageName};
 
 /// A workspace target describes the dependencies, activations and task
 /// available to a specific feature, in a specific environment, and optionally
@@ -320,6 +320,15 @@ impl WorkspaceTarget {
         };
         if let Some(editable) = editable {
             requirement.set_editable(editable);
+        }
+
+        if requirement.no_deps()
+            && matches!(requirement.source(), PixiPypiSource::Registry { .. })
+            && !requirement.is_exact_registry_pin()
+        {
+            return Err(DependencyError::NoDepsRegistryNotPinned(
+                name.as_source().into(),
+            ));
         }
 
         // Convert public behavior to internal behavior
