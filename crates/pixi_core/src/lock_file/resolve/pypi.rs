@@ -62,6 +62,10 @@ use uv_resolver::{
 };
 use uv_types::EmptyInstalledPackages;
 
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("failed to apply no-deps filtering: {0}")]
+struct NoDepsFilteringError(String);
+
 use crate::{
     environment::CondaPrefixUpdated,
     lock_file::{
@@ -302,6 +306,8 @@ pub async fn resolve_pypi(
 ) -> miette::Result<(LockedPypiPackages, Option<CondaPrefixUpdated>)> {
     // Solve python packages
     pb.set_message("resolving pypi dependencies");
+
+    let (no_deps_roots, normal_roots) = split_no_deps_roots(&dependencies);
 
     // Determine which pypi packages are already installed as conda package.
     let conda_python_packages = locked_pixi_records
@@ -783,6 +789,10 @@ pub async fn resolve_pypi(
         .await
         .map_err(|e| SolveError::Locking(e.into()))?;
 
+        let locked_packages =
+            prune_no_deps_packages(locked_packages, &no_deps_roots, &normal_roots)
+                .map_err(|e| SolveError::Locking(Box::new(NoDepsFilteringError(e.to_string()))))?;
+
         let conda_task = lazy_build_dispatch.conda_task;
 
         Ok::<_, SolveError>((locked_packages, conda_task))
@@ -930,6 +940,91 @@ fn get_url_or_path(
             Ok(url)
         }
     }
+}
+
+fn split_no_deps_roots(
+    dependencies: &IndexMap<uv_normalize::PackageName, IndexSet<PixiPypiSpec>>,
+) -> (
+    HashSet<uv_normalize::PackageName>,
+    HashSet<uv_normalize::PackageName>,
+) {
+    let mut no_deps_roots = HashSet::new();
+    let mut normal_roots = HashSet::new();
+    for (name, specs) in dependencies {
+        let all_no_deps = specs.iter().all(PixiPypiSpec::no_deps);
+        if all_no_deps {
+            no_deps_roots.insert(name.clone());
+        } else {
+            normal_roots.insert(name.clone());
+        }
+    }
+    (no_deps_roots, normal_roots)
+}
+
+fn prune_no_deps_packages(
+    locked_packages: LockedPypiPackages,
+    no_deps_roots: &HashSet<uv_normalize::PackageName>,
+    normal_roots: &HashSet<uv_normalize::PackageName>,
+) -> miette::Result<LockedPypiPackages> {
+    if no_deps_roots.is_empty() {
+        return Ok(locked_packages);
+    }
+
+    let mut all_names = HashSet::new();
+    for (data, _) in &locked_packages {
+        all_names.insert(to_uv_normalize(&data.name).into_diagnostic()?);
+    }
+
+    let mut deps_map: HashMap<uv_normalize::PackageName, Vec<uv_normalize::PackageName>> =
+        HashMap::new();
+    for (data, _) in &locked_packages {
+        let name = to_uv_normalize(&data.name).into_diagnostic()?;
+        let mut deps = Vec::new();
+        for req in &data.requires_dist {
+            let dep_name = to_uv_normalize(&req.name).into_diagnostic()?;
+            if all_names.contains(&dep_name) {
+                deps.push(dep_name);
+            }
+        }
+        deps_map.insert(name, deps);
+    }
+
+    let mut allowed = HashSet::new();
+    let mut stack = normal_roots.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = stack.pop() {
+        if allowed.insert(name.clone()) {
+            if let Some(deps) = deps_map.get(&name) {
+                for dep in deps {
+                    if !allowed.contains(dep) {
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    for name in no_deps_roots {
+        allowed.insert(name.clone());
+    }
+
+    let no_deps_only = no_deps_roots
+        .difference(normal_roots)
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let mut filtered = Vec::new();
+    for (mut data, env) in locked_packages {
+        let name = to_uv_normalize(&data.name).into_diagnostic()?;
+        if !allowed.contains(&name) {
+            continue;
+        }
+        if no_deps_only.contains(&name) {
+            data.requires_dist.clear();
+        }
+        filtered.push((data, env));
+    }
+
+    Ok(filtered)
 }
 
 /// Create a vector of locked packages from a resolution
@@ -1160,9 +1255,10 @@ async fn lock_pypi_packages(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use pep508_rs::Requirement;
 
     // In this case we want to make the path relative to the project_root or lock
     // file path
@@ -1188,6 +1284,40 @@ mod tests {
         let path =
             process_uv_path_url(&url, &PathBuf::from("/a/c/z"), &PathBuf::from("/a/b/f")).unwrap();
         assert_eq!(path.as_str(), "../../c/z");
+    }
+
+    #[test]
+    fn test_prune_no_deps_packages() {
+        fn make_record(name: &str, deps: &[&str]) -> PypiRecord {
+            let requires_dist = deps
+                .iter()
+                .map(|dep| Requirement::parse(dep, Path::new(".")).unwrap())
+                .collect();
+            let data = PypiPackageData {
+                name: pep508_rs::PackageName::new(name.to_string()).unwrap(),
+                version: pep440_rs::Version::from_str("1.0.0").unwrap(),
+                requires_python: None,
+                location: UrlOrPath::Url(Url::parse("https://example.com/pkg.whl").unwrap()),
+                requires_dist,
+                hash: None,
+                editable: false,
+            };
+            (data, PypiPackageEnvironmentData::default())
+        }
+
+        let locked = vec![
+            make_record("a", &["b"]),
+            make_record("b", &["c"]),
+            make_record("c", &[]),
+        ];
+
+        let no_deps_roots =
+            HashSet::from_iter([uv_normalize::PackageName::from_str("a").unwrap()]);
+        let normal_roots = HashSet::new();
+
+        let pruned = prune_no_deps_packages(locked, &no_deps_roots, &normal_roots).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert!(pruned[0].0.requires_dist.is_empty());
     }
 
     // In this case we want to make the path relative to the project_root or lock

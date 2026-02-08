@@ -586,6 +586,7 @@ pub async fn get_update_lock_file_and_prefixes<'env>(
         .update_lock_file(UpdateLockFileOptions {
             lock_file_usage: update_lock_file_options.lock_file_usage,
             no_install,
+            pypi_no_deps: update_lock_file_options.pypi_no_deps,
             max_concurrent_solves: update_lock_file_options.max_concurrent_solves,
         })
         .await?

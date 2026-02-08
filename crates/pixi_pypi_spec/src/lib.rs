@@ -141,6 +141,9 @@ pub struct PixiPypiSpec {
     /// Optional package extras to install.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extras: Vec<ExtraName>,
+    /// Do not resolve or lock transitive dependencies for this package.
+    #[serde(default, skip_serializing_if = "is_false", rename = "no-deps")]
+    pub no_deps: bool,
     /// The environment markers that decide if/when this package gets installed
     #[serde(
         default,
@@ -200,6 +203,7 @@ impl From<PixiPypiSource> for PixiPypiSpec {
             extras: Vec::new(),
             source,
             env_markers: MarkerTree::default(),
+            no_deps: false,
         }
     }
 }
@@ -220,6 +224,7 @@ impl PixiPypiSpec {
             extras,
             source,
             env_markers,
+            no_deps: false,
         }
     }
 
@@ -231,6 +236,22 @@ impl PixiPypiSpec {
     /// Returns a mutable reference to the source.
     pub fn source_mut(&mut self) -> &mut PixiPypiSource {
         &mut self.source
+    }
+
+    /// Returns whether this spec disables dependency resolution.
+    pub fn no_deps(&self) -> bool {
+        self.no_deps
+    }
+
+    /// Set whether this spec disables dependency resolution.
+    pub fn set_no_deps(&mut self, no_deps: bool) {
+        self.no_deps = no_deps;
+    }
+
+    /// Set whether this spec disables dependency resolution, returning self.
+    pub fn with_no_deps(mut self, no_deps: bool) -> Self {
+        self.no_deps = no_deps;
+        self
     }
 
     /// Returns true if this is a source dependency (Git, Path, or Url).
@@ -323,9 +344,14 @@ impl PixiPypiSpec {
         }
 
         updated.env_markers.or(requirement.marker.clone());
+        updated.no_deps = self.no_deps;
 
         Ok(updated)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
